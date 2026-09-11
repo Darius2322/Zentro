@@ -1,0 +1,594 @@
+// ============================================================================
+// Zentro — multi-tenant appointment booking platform
+// ============================================================================
+// Design notes:
+// - Every business-owned row carries business_id. Application code NEVER
+//   trusts a business_id supplied by the client; it is always re-derived
+//   from the authenticated session (see src/lib/auth.ts + src/lib/tenant.ts).
+// - Postgres Row Level Security policies are layered on top of this schema
+//   in prisma/migrations/<ts>_add_rls/migration.sql (written by hand, since
+//   Prisma cannot express RLS declaratively). RLS is defense-in-depth, not
+//   a replacement for application-level checks.
+// - Booking overlap protection uses a Postgres EXCLUDE constraint (btree_gist)
+//   added in a raw-SQL migration — see docs/DOUBLE_BOOKING_PROTECTION.md.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum PlatformRole {
+  PLATFORM_ADMIN
+  BUSINESS_OWNER
+  STAFF
+  CUSTOMER
+}
+
+enum BusinessStatus {
+  PENDING
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum ResourceStatus {
+  AVAILABLE
+  MAINTENANCE
+  RETIRED
+}
+
+enum TimeOffType {
+  HOLIDAY
+  SICK
+  PERSONAL
+  TRAINING
+  CUSTOM
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+// ---------------------------------------------------------------------------
+// Users & platform admin
+// ---------------------------------------------------------------------------
+
+// A single users table backs all human logins (platform admin, owner, staff).
+// Customers are intentionally NOT required to have a user row — they can book
+// as guests, identified by booking reference + phone/email. If a business
+// enables customer accounts, a User row with role CUSTOMER is created.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         PlatformRole
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Platform-admin-only 2FA (spec #56). Scoped to the highest-privilege
+  // role rather than every account, to keep the surface area contained.
+  twoFactorEnabled        Boolean @default(false)
+  twoFactorSecretEncrypted String?
+
+  // Present only for BUSINESS_OWNER / STAFF users.
+  staffProfile   Staff?
+  ownedBusinesses Business[] @relation("BusinessOwnerUser")
+  auditLogs      AuditLog[]
+  sentInvitations Invitation[] @relation("InvitedBy")
+
+  @@index([role])
+}
+
+// ---------------------------------------------------------------------------
+// Businesses (tenants)
+// ---------------------------------------------------------------------------
+
+model Business {
+  id          String         @id @default(cuid())
+  slug        String         @unique // used in /b/{slug}/...
+  name        String
+  status      BusinessStatus @default(PENDING)
+  ownerUserId String
+  owner       User           @relation("BusinessOwnerUser", fields: [ownerUserId], references: [id])
+
+  description String?
+  logoUrl     String?
+  phone       String?
+  whatsapp    String?
+  email       String?
+  address     String?
+  timezone    String @default("Africa/Nairobi")
+
+  // Booking rules
+  bookingIntervalMinutes   Int @default(15)
+  minNoticeMinutes         Int @default(30)
+  maxAdvanceBookingDays    Int @default(30)
+  cancellationPolicy       String?
+  allowCustomerAccounts    Boolean @default(false)
+
+  // Approval / lifecycle audit trail
+  submittedAt DateTime  @default(now())
+  reviewedAt  DateTime?
+  reviewedBy  String?
+  rejectionReason String?
+  suspendedAt DateTime?
+  suspendedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  hours              BusinessHours[]
+  services           Service[]
+  serviceCategories  ServiceCategory[]
+  staff              Staff[]
+  resources          Resource[]
+  resourceTypes      ResourceType[]
+  customers          Customer[]
+  bookings           Booking[]
+  receipts           Receipt[]
+  payments           Payment[]
+  invitations        Invitation[]
+  auditLogs          AuditLog[]
+  calendarConnections ExternalCalendarConnection[]
+  notifications      Notification[]
+
+  @@index([status])
+}
+
+// Weekly opening hours. Supports split shifts (multiple rows per weekday).
+model BusinessHours {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  // 0 = Sunday ... 6 = Saturday
+  weekday    Int
+  isClosed   Boolean  @default(false)
+  startTime  String?  // "09:00" — stored as text, interpreted in business timezone
+  endTime    String?  // "17:00"
+
+  @@index([businessId, weekday])
+}
+
+// One-off closed dates (holidays, special closures) distinct from weekly hours.
+model BusinessClosedDate {
+  id         String   @id @default(cuid())
+  businessId String
+  date       DateTime @db.Date
+  reason     String?
+
+  @@unique([businessId, date])
+}
+
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
+
+model ServiceCategory {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  sortOrder  Int      @default(0)
+  services   Service[]
+
+  @@unique([businessId, name])
+}
+
+model Service {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      ServiceCategory? @relation(fields: [categoryId], references: [id])
+
+  name          String
+  description   String?
+  imageUrl      String?
+  priceCents    Int // stored as integer minor units to avoid float rounding
+  currency      String @default("KES")
+  durationMinutes Int
+  bufferMinutes   Int @default(0)
+  isActive        Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  qualifiedStaff    StaffService[]
+  requiredResources ServiceResource[]
+  bookings          Booking[]
+
+  @@index([businessId, isActive])
+}
+
+// Which staff members are qualified to perform which service.
+model StaffService {
+  staffId   String
+  staff     Staff   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  priority  Int     @default(0) // used for "any available staff" assignment ordering
+
+  @@id([staffId, serviceId])
+}
+
+// Which resource TYPE (and how many) a service requires, e.g. "1 manicure table".
+model ServiceResource {
+  id             String   @id @default(cuid())
+  serviceId      String
+  service        Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  resourceTypeId String
+  resourceType   ResourceType @relation(fields: [resourceTypeId], references: [id])
+  quantity       Int      @default(1)
+
+  @@unique([serviceId, resourceTypeId])
+}
+
+// ---------------------------------------------------------------------------
+// Staff
+// ---------------------------------------------------------------------------
+
+model Staff {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String?  @unique
+  user       User?    @relation(fields: [userId], references: [id])
+
+  fullName   String
+  email      String
+  phone      String?
+  title      String? // e.g. "Senior Stylist"
+  isActive   Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  qualifiedServices StaffService[]
+  workingHours      StaffWorkingHours[]
+  breaks            StaffBreak[]
+  timeOff           StaffTimeOff[]
+  bookings          Booking[]
+
+  @@unique([businessId, email])
+  @@index([businessId, isActive])
+}
+
+model StaffWorkingHours {
+  id       String @id @default(cuid())
+  staffId  String
+  staff    Staff  @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  weekday  Int // 0=Sunday..6=Saturday
+  isOff    Boolean @default(false)
+  startTime String? // "09:00"
+  endTime   String? // "17:00"
+
+  @@index([staffId, weekday])
+}
+
+model StaffBreak {
+  id        String @id @default(cuid())
+  staffId   String
+  staff     Staff  @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  weekday   Int // recurring weekly break, e.g. lunch
+  startTime String // "13:00"
+  endTime   String // "14:00"
+  label     String @default("Break")
+
+  @@index([staffId, weekday])
+}
+
+model StaffTimeOff {
+  id        String      @id @default(cuid())
+  staffId   String
+  staff     Staff       @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  type      TimeOffType
+  startsAt  DateTime // absolute UTC instant
+  endsAt    DateTime
+  note      String?
+
+  @@index([staffId, startsAt, endsAt])
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+model ResourceType {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String // e.g. "Manicure Table", "Barber Chair"
+
+  resources         Resource[]
+  serviceResources  ServiceResource[]
+
+  @@unique([businessId, name])
+}
+
+model Resource {
+  id             String         @id @default(cuid())
+  businessId     String
+  business       Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  resourceTypeId String
+  resourceType   ResourceType   @relation(fields: [resourceTypeId], references: [id])
+  name           String // e.g. "Manicure Table 1"
+  status         ResourceStatus @default(AVAILABLE)
+
+  bookingResources BookingResource[]
+
+  @@unique([businessId, name])
+  @@index([businessId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String?  // set only if allowCustomerAccounts and customer registered
+
+  fullName String
+  phone    String
+  email    String?
+  notes    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@unique([businessId, phone])
+  @@index([businessId])
+}
+
+// ---------------------------------------------------------------------------
+// Bookings — the transactional core
+// ---------------------------------------------------------------------------
+
+model Booking {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  serviceId  String
+  service    Service  @relation(fields: [serviceId], references: [id])
+  // Snapshot fields: historical bookings must retain their original service
+  // info even if the service is later edited/repriced (see spec #45).
+  serviceNameSnapshot     String
+  servicePriceCentsSnapshot Int
+  serviceDurationSnapshot Int
+
+  staffId    String
+  staff      Staff    @relation(fields: [staffId], references: [id])
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  startsAt DateTime // UTC instant
+  endsAt   DateTime // UTC instant (includes buffer)
+
+  status     BookingStatus @default(PENDING)
+  bookingReference String  @unique // human-facing, e.g. BK-2026-004821
+
+  notes String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  confirmedAt DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  cancelReason String?
+
+  resources BookingResource[]
+  payment   Payment?
+  receipt   Receipt?
+
+  // NOTE: True overlap prevention (same staff, overlapping [startsAt,endsAt))
+  // is enforced via a Postgres EXCLUDE constraint using btree_gist, added in
+  // a raw SQL migration, because Prisma has no native range-exclusion syntax.
+  // This unique index is a coarse first line of defense against exact
+  // duplicate submissions; it does NOT by itself prevent overlapping ranges.
+  @@index([businessId, staffId, startsAt])
+  @@index([businessId, startsAt])
+  @@index([customerId])
+}
+
+// Join table: which physical resources are reserved for a booking.
+model BookingResource {
+  id         String   @id @default(cuid())
+  bookingId  String
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id])
+
+  @@unique([bookingId, resourceId])
+  // Same note as above: true overlap protection for a given resourceId across
+  // time ranges is enforced by a Postgres EXCLUDE constraint, not by Prisma.
+  @@index([resourceId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments & receipts
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id         String        @id @default(cuid())
+  businessId String
+  business   Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  bookingId  String        @unique
+  booking    Booking       @relation(fields: [bookingId], references: [id])
+
+  amountCents Int
+  currency    String @default("KES")
+  method      String? // "M-Pesa", "Card", "Cash" — provider-agnostic
+  status      PaymentStatus @default(PENDING)
+  providerRef String? // external provider transaction id, verified server-side
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  receipt Receipt?
+}
+
+model Receipt {
+  id             String   @id @default(cuid())
+  businessId     String
+  business       Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  bookingId      String   @unique
+  booking        Booking  @relation(fields: [bookingId], references: [id])
+  paymentId      String?  @unique
+  payment        Payment? @relation(fields: [paymentId], references: [id])
+
+  receiptNumber  String   @unique // e.g. RCP-2026-004821, generated server-side
+  subtotalCents  Int
+  discountCents  Int @default(0)
+  taxCents       Int @default(0)
+  totalCents     Int
+  currency       String @default("KES")
+
+  issuedAt DateTime @default(now())
+
+  @@index([businessId])
+}
+
+// A dedicated counter table per business+year avoids collisions when
+// generating sequential receipt numbers under concurrent writes.
+model ReceiptCounter {
+  businessId String
+  year       Int
+  lastValue  Int @default(0)
+
+  @@id([businessId, year])
+}
+
+// ---------------------------------------------------------------------------
+// External calendar (Google Calendar) integration
+// ---------------------------------------------------------------------------
+
+model ExternalCalendarConnection {
+  id           String   @id @default(cuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  staffId      String?  // null = business-level calendar
+  provider     String   @default("google")
+  // OAuth tokens are ENCRYPTED at rest (see src/lib/crypto.ts) and are never
+  // sent to the client under any circumstances.
+  encryptedAccessToken  String
+  encryptedRefreshToken String
+  tokenExpiresAt        DateTime
+  calendarId             String
+  isActive               Boolean @default(true)
+
+  busyPeriods ExternalCalendarBusyPeriod[]
+
+  @@index([businessId])
+}
+
+// Cached FreeBusy results so the availability engine doesn't call Google on
+// every request. Refreshed periodically / on demand.
+model ExternalCalendarBusyPeriod {
+  id           String   @id @default(cuid())
+  connectionId String
+  connection   ExternalCalendarConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  startsAt     DateTime
+  endsAt       DateTime
+  fetchedAt    DateTime @default(now())
+
+  @@index([connectionId, startsAt, endsAt])
+}
+
+// ---------------------------------------------------------------------------
+// Invitations (staff onboarding)
+// ---------------------------------------------------------------------------
+
+model Invitation {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  staffId     String   // pre-created Staff row this invitation activates
+  email       String
+  invitedById String
+  invitedBy   User     @relation("InvitedBy", fields: [invitedById], references: [id])
+
+  // Only a hash of the token is stored — the raw token is emailed once and
+  // never persisted, so a DB leak cannot be used to accept invitations.
+  tokenHash   String   @unique
+  status      InvitationStatus @default(PENDING)
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([businessId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications & audit
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  channel    String // "email" | "sms" | "whatsapp"
+  recipient  String
+  template   String // "booking_confirmation" | "booking_reminder" | ...
+  payload    Json
+  status     String @default("PENDING") // PENDING | SENT | FAILED
+  createdAt  DateTime @default(now())
+  sentAt     DateTime?
+
+  @@index([businessId, status])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  businessId String?  // null for platform-level actions
+  business   Business? @relation(fields: [businessId], references: [id])
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  actorRole  PlatformRole?
+
+  action     String // "business.approved", "staff.added", "booking.cancelled", ...
+  targetType String? // "Business" | "Staff" | "Booking" | ...
+  targetId   String?
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  @@index([action])
+}

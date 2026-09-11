@@ -1,0 +1,13 @@
+{
+  "name": "Zentro",
+  "short_name": "Zentro",
+  "description": "Book appointments at your favorite salon, barbershop, or beauty studio.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F1F2EF",
+  "theme_color": "#1F6F5C",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
