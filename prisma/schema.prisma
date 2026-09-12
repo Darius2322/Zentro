@@ -226,6 +226,7 @@ model Service {
   qualifiedStaff    StaffService[]
   requiredResources ServiceResource[]
   bookings          Booking[]
+  invitations       Invitation[]
 
   @@index([businessId, isActive])
 }
@@ -278,6 +279,7 @@ model Staff {
   breaks            StaffBreak[]
   timeOff           StaffTimeOff[]
   bookings          Booking[]
+  invitations       Invitation[]
 
   @@unique([businessId, email])
   @@index([businessId, isActive])
@@ -539,6 +541,7 @@ model Invitation {
   businessId  String
   business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
   staffId     String   // pre-created Staff row this invitation activates
+  staff       Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
   email       String
   invitedById String
   invitedBy   User     @relation("InvitedBy", fields: [invitedById], references: [id])
