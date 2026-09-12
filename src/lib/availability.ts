@@ -14,7 +14,7 @@
  */
 
 import { addMinutes, isBefore, isAfter, isEqual, startOfDay, endOfDay } from "date-fns";
-import { zonedTimeToUtc, utcToZonedTime, format } from "date-fns-tz";
+import { fromZonedTime, toZonedTime, format } from "date-fns-tz";
 import { prisma } from "./db";
 
 export interface TimeInterval {
@@ -91,11 +91,11 @@ function subtractIntervals(free: TimeInterval, busy: TimeInterval[]): TimeInterv
 function timeStringToUtc(dateStr: string, timeStr: string, timezone: string): Date {
   const [h, m] = timeStr.split(":").map(Number);
   const local = `${dateStr}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`;
-  return zonedTimeToUtc(local, timezone);
+  return fromZonedTime(local, timezone);
 }
 
 function dateStringInTz(instant: Date, timezone: string): string {
-  return format(utcToZonedTime(instant, timezone), "yyyy-MM-dd", { timeZone: timezone });
+  return format(toZonedTime(instant, timezone), "yyyy-MM-dd", { timeZone: timezone });
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ export async function computeAvailability(query: AvailabilityQuery): Promise<{
     cursor = addMinutes(cursor, 24 * 60)
   ) {
     const dateStr = dateStringInTz(cursor, timezone);
-    const weekday = utcToZonedTime(cursor, timezone).getDay();
+    const weekday = toZonedTime(cursor, timezone).getDay();
 
     if (closedDateSet.has(dateStr)) {
       results.push({ date: dateStr, slots: [] });

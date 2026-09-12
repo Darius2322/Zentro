@@ -99,8 +99,8 @@ export async function POST(req: NextRequest, { params }: { params: { slug: strin
       serviceId: d.service_id,
       staffId: d.staff_id,
       startsAt: d.starts_at,
-      customer: d.customer,
-    });
+      
+    })
 
     await prisma.auditLog.create({
       data: {
