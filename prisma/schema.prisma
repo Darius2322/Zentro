@@ -226,8 +226,6 @@ model Service {
   qualifiedStaff    StaffService[]
   requiredResources ServiceResource[]
   bookings          Booking[]
-  invitations       Invitation[]
-
   @@index([businessId, isActive])
 }
 
