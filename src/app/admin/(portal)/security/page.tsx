@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import ChangePasswordCard from "@/components/ChangePasswordCard";
 
 export default function AdminSecurityPage() {
   const [setup, setSetup] = useState<{ secret: string; otpauth_uri: string } | null>(null);
@@ -53,7 +54,9 @@ export default function AdminSecurityPage() {
   return (
     <div>
       <h1>Security</h1>
-      <p className="page-subtitle">Two-factor authentication for platform admin accounts.</p>
+      <p className="page-subtitle">Your password and two-factor authentication.</p>
+
+      <ChangePasswordCard />
 
       <div className="card" style={{ maxWidth: 440 }}>
         {message && <p className="error-banner" style={{ background: "var(--success-bg)", color: "var(--accent)" }}>{message}</p>}
